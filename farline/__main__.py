@@ -3,11 +3,13 @@
 import argparse
 from pathlib import Path
 
+from .clock import utc_now
 from .display import Display
 from .game import Game
 from .market import GameError
 from .models import GameState
-from .persistence import load_game, valid_name
+from .persistence import SaveStamp, load_game, valid_name
+from .session import catch_up
 from .terminal import Terminal
 
 
@@ -33,12 +35,19 @@ def main() -> int:
     try:
         path = args.save.expanduser()
         resumed = path.exists()
-        state = load_game(path) if resumed else GameState.fresh(name, args.seed)
+        if resumed:
+            state, stamp = load_game(path)
+            game = Game(state)
+            notes = catch_up(game, stamp, utc_now())
+        else:
+            game = Game(GameState.fresh(name, args.seed))
+            stamp = SaveStamp(None, None)
+            notes = []
     except (GameError, OSError, RuntimeError) as error:
         display.line(str(error), "red")
         return 1
 
-    terminal = Terminal(Game(state), path, args.rate, display, resumed)
+    terminal = Terminal(game, path, args.rate, display, resumed, stamp, notes)
     try:
         terminal.cmdloop()
     except KeyboardInterrupt:

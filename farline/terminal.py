@@ -4,16 +4,21 @@ import cmd
 import re
 import shlex
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from math import ceil
 from pathlib import Path
 
 from .catalog import ATTRIBUTES, ITEMS, MODULES, SKILLS, SLOTS, SYSTEMS, Hull, Module
+from .clock import utc_now
 from .display import Display
 from .game import LEVELS, Game
+from .industry import RECIPES, find_recipe
 from .market import GameError, credits
 from .models import volume
-from .persistence import load_game, save_game
+from .persistence import SaveStamp, load_game, save_game
+from .session import catch_up, effective_save_time
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,7 @@ class Command:
 COMMANDS = {
     "help": Command("help [command]", "Show commands or explain one command.", 0, 1),
     "status": Command("status", "Read the flight deck, wallet, and clock."),
+    "events": Command("events [count]", "Show recent world-ledger entries. Count defaults to 10.", 0, 1),
     "map": Command("map", "List systems and travel times for this hull."),
     "sites": Command("sites", "Survey local ore reserves and the patrol lane."),
     "undock": Command("undock", "Leave the local station."),
@@ -52,6 +58,8 @@ COMMANDS = {
     "buy": Command("buy <item> [quantity]", "Buy from the local station market.", 1, 2),
     "sell": Command("sell <item | ship-id> [quantity]",
                     "Sell from the local hangar, or sell a parked ship by its fleet ID.", 1, 2),
+    "industry": Command("industry [start <recipe> [quantity]]",
+                        "Show recipes and the job queue, or start a docked manufacturing job.", 0, 3),
     "mine": Command("mine [ore] [cycles]", "Run 1–20 extraction cycles at the local belt.", 0, 2),
     "engage": Command("engage", "Intercept the patrol in this system."),
     "fire": Command("fire", "Shoot fitted guns for one combat round."),
@@ -101,15 +109,22 @@ def _license(requirement: tuple[str, int] | None) -> str:
 
 
 class Terminal(cmd.Cmd):
-    def __init__(self, game: Game, path: Path, rate: float, display: Display, resumed: bool):
+    def __init__(self, game: Game, path: Path, rate: float, display: Display, resumed: bool,
+                 stamp: SaveStamp, notes: list[str] | None = None, *,
+                 clock: Callable[[], datetime] | None = None,
+                 monotonic: Callable[[], float] | None = None):
         super().__init__()
         self.game = game
         self.path = path
         self.rate = rate
         self.display = display
         self.resumed = resumed
+        self.stamp = stamp
+        self.notes = list(notes or [])
+        self.clock = clock or utc_now
+        self.monotonic = monotonic or time.monotonic
         self.exit_code = 0
-        self._last_clock = time.monotonic()
+        self._last_clock = self.monotonic()
         self._update_prompt()
 
     def preloop(self) -> None:
@@ -118,6 +133,7 @@ class Terminal(cmd.Cmd):
         verb = "Resumed" if self.resumed else "Pilot"
         self.display.panel("FARLINE LEDGER", f"{verb} · {self.game.pilot.name} at {origin}\n"
                            "Type help for commands, status for the flight deck, or sites for local work.")
+        self.display.lines(self.notes)
 
     def _update_prompt(self) -> None:
         state = self.game.state
@@ -125,9 +141,11 @@ class Terminal(cmd.Cmd):
         self.prompt = f"farline:{self.game.system}/{mode}> "
 
     def precmd(self, line: str) -> str:
-        now = time.monotonic()
-        self.display.lines(self.game.advance((now - self._last_clock) * self.rate))
+        now = self.monotonic()
+        delta = now - self._last_clock
         self._last_clock = now
+        if delta > 0:
+            self.display.lines(self.game.advance(delta * self.rate))
         return line
 
     def postcmd(self, stop: bool, line: str) -> bool:
@@ -186,6 +204,13 @@ class Terminal(cmd.Cmd):
             training = f"{SKILLS[skill].name} {LEVELS[level]} · {_duration(remaining)} game time left"
         else:
             training = "Idle · queue add <skill>"
+        if state.jobs:
+            job = state.jobs[0]
+            recipe = RECIPES[job.recipe]
+            industry = (f"{len(state.jobs)} queued · {recipe.name} × {job.quantity} "
+                        f"at {SYSTEMS[job.station].station}")
+        else:
+            industry = "Idle · industry"
         self.display.panel(
             "Flight deck",
             f"{game.pilot.name}  |  Wallet {credits(game.pilot.balance)}\n"
@@ -193,7 +218,8 @@ class Terminal(cmd.Cmd):
             f"Shield {hp.shield}/{stats.shield}   Armor {hp.armor}/{stats.armor}   Hull {hp.hull}/{stats.hull}\n"
             f"Capacitor {ship.capacitor:.1f}/{stats.capacitor}   Cargo {volume(ship.cargo)}/{stats.cargo}\n"
             f"Training · {training}\n"
-            f"Clock · {_duration(int(state.elapsed))} elapsed at {self.rate:g}× real time",
+            f"Industry · {industry}\n"
+            f"Clock · {_duration(int(state.elapsed))} game time · live rate {self.rate:g}×",
         )
         self._show_encounter()
 
@@ -367,9 +393,13 @@ class Terminal(cmd.Cmd):
 
     def do_load(self, args: list[str]) -> None:
         if not args:
-            self.game.state = load_game(self.path)
-            self._last_clock = time.monotonic()
+            state, stamp = load_game(self.path)
+            self.game = Game(state)
+            self.stamp = stamp
+            notes = catch_up(self.game, stamp, self.clock())
+            self._last_clock = self.monotonic()
             self.display.line(f"Loaded {self.path}.", "green")
+            self.display.lines(notes)
         else:
             item = _find(args[0], ITEMS, "item")
             self.display.line(self.game.transfer(item, _quantity(args, all_allowed=True), loading=True))
@@ -410,6 +440,55 @@ class Terminal(cmd.Cmd):
             key = _find(args[0], ITEMS, "item")
         quantity = _integer(args[1]) if len(args) == 2 else 1
         self.display.line(self.game.sell(key, quantity))
+
+    def do_industry(self, args: list[str]) -> None:
+        if not args:
+            self._show_industry()
+            return
+        if args[0].casefold() != "start" or not 2 <= len(args) <= 3:
+            raise GameError(f"Usage: {COMMANDS['industry'].syntax}")
+        quantity = _integer(args[2]) if len(args) == 3 else 1
+        self.display.line(self.game.start_job(find_recipe(args[1]), quantity))
+
+    def _show_industry(self) -> None:
+        self.display.table(
+            "Manufacturing recipes",
+            ("ID", "Inputs", "Output", "Per unit"),
+            ((recipe.id,
+              ", ".join(f"{qty} {ITEMS[item].name}" for item, qty in recipe.inputs),
+              f"{recipe.output_qty} {ITEMS[recipe.output].name}",
+              _duration(recipe.seconds))
+             for recipe in RECIPES.values()),
+            right=(3,),
+        )
+        jobs = self.game.state.jobs
+        if not jobs:
+            self.display.line("No queued jobs. Start one while docked: industry start refine-bars")
+            return
+        rows = []
+        for index, job in enumerate(jobs, 1):
+            recipe = RECIPES[job.recipe]
+            progress = f"{job.progress:.0f}/{recipe.seconds}s" if index == 1 else "waiting"
+            rows.append((str(index), recipe.name, SYSTEMS[job.station].station,
+                         str(job.quantity), progress))
+        self.display.table("Manufacturing queue · FIFO",
+                           ("#", "Recipe", "Output station", "Units left", "Progress"),
+                           rows, right=(0, 3, 4))
+
+    def do_events(self, args: list[str]) -> None:
+        count = 10 if not args else _integer(args[0])
+        if count < 1:
+            raise GameError("Count must be a whole number of at least 1.")
+        events = self.game.state.events[-count:]
+        if not events:
+            self.display.line("No ledger events yet.")
+            return
+        self.display.table(
+            "Event ledger · newest last",
+            ("#", "World time", "Kind", "Summary"),
+            ((str(event.seq), _duration(event.time), event.kind, event.summary) for event in events),
+            right=(0, 1),
+        )
 
     def do_mine(self, args: list[str]) -> None:
         ore = None
@@ -454,7 +533,9 @@ class Terminal(cmd.Cmd):
         self._combat("flee")
 
     def _save(self) -> None:
-        save_game(self.path, self.game.state)
+        moment = effective_save_time(self.stamp.saved_at, self.clock())
+        save_game(self.path, self.game.state, rate=self.rate, saved_at=moment)
+        self.stamp = SaveStamp(moment, self.rate)
         self.display.line(f"Saved {self.path}.", "green")
 
     def do_save(self, args: list[str]) -> None:

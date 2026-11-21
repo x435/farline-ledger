@@ -2,23 +2,42 @@
 
 import json
 import os
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from math import isfinite
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .catalog import ATTRIBUTES, HULLS, ITEMS, MODULES, SKILLS, SYSTEMS
+from .clock import format_utc, parse_utc
+from .events import KINDS, LedgerEvent
+from .industry import RECIPES, Job
 from .market import GameError, Market
 from .models import MAX_LEVEL, Character, Encounter, GameState, Integrity, Ship
 
-VERSION = 1
+VERSION = 2
+SUPPORTED_VERSIONS = (1, 2)
 
 
-def save_game(path: Path, state: GameState) -> None:
+@dataclass(frozen=True)
+class SaveStamp:
+    """Wall-clock metadata. Absent on a migrated v1 career, which has no offline interval."""
+
+    saved_at: datetime | None
+    rate: float | None
+
+
+def save_game(path: Path, state: GameState, *, rate: float, saved_at: datetime) -> None:
     temporary = None
     try:
-        payload = json.dumps({"version": VERSION, "state": asdict(state)},
-                             indent=2, ensure_ascii=False, allow_nan=False)
+        if type(rate) not in (int, float) or not isfinite(rate) or not 1 <= rate <= 60:
+            raise ValueError("Saved rate must be from 1 to 60.")
+        payload = json.dumps({
+            "version": VERSION,
+            "saved_at": format_utc(saved_at),
+            "rate": float(rate),
+            "state": asdict(state),
+        }, indent=2, ensure_ascii=False, allow_nan=False)
         path.parent.mkdir(parents=True, exist_ok=True)
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                 prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
@@ -129,27 +148,86 @@ def _check_world(state: GameState) -> None:
         patrol = SYSTEMS[active.system].patrol
         _verify(_integer(state.encounter.turns), "Invalid combat round.")
         _check_health(state.encounter.health, patrol.shield, patrol.armor, patrol.hull)
+    _check_ledger(state)
+    _check_jobs(state)
 
 
-def load_game(path: Path) -> GameState:
+def _json_data(value: object, depth: int = 0) -> bool:
+    if depth > 6:
+        return False
+    if value is None or type(value) is bool or type(value) is str:
+        return True
+    if type(value) is int or (type(value) is float and isfinite(value)):
+        return True
+    if type(value) is list:
+        return all(_json_data(item, depth + 1) for item in value)
+    if type(value) is dict:
+        return all(type(key) is str and _json_data(item, depth + 1) for key, item in value.items())
+    return False
+
+
+def _check_ledger(state: GameState) -> None:
+    _verify(isinstance(state.events, list) and _integer(state.next_event, 1), "Invalid event ledger.")
+    for index, event in enumerate(state.events, start=1):
+        _verify(isinstance(event, LedgerEvent) and event.seq == index and event.kind in KINDS
+                and isinstance(event.summary, str) and event.summary
+                and _number(event.time) and event.time <= state.elapsed + 1e-6
+                and _json_data(event.data), "Invalid ledger event.")
+    _verify(state.next_event == len(state.events) + 1, "Event sequence is not contiguous.")
+
+
+def _check_jobs(state: GameState) -> None:
+    _verify(isinstance(state.jobs, list), "Invalid manufacturing queue.")
+    for job in state.jobs:
+        recipe = RECIPES.get(job.recipe) if isinstance(job, Job) else None
+        _verify(recipe is not None and job.station in SYSTEMS
+                and _integer(job.quantity, 1) and _integer(job.ordered, 1)
+                and job.ordered >= job.quantity
+                and _number(job.progress) and job.progress < recipe.seconds,
+                "Invalid manufacturing job.")
+
+
+def _assemble_state(raw: dict) -> GameState:
+    raw["character"] = Character(**raw["character"])
+    raw["ships"] = {
+        ship_id: Ship(**{**ship, "health": Integrity(**ship["health"])})
+        for ship_id, ship in raw["ships"].items()
+    }
+    raw["markets"] = {system: Market(**market) for system, market in raw["markets"].items()}
+    if raw["encounter"] is not None:
+        raw["encounter"] = Encounter(**{**raw["encounter"],
+                                       "health": Integrity(**raw["encounter"]["health"])})
+    if "events" in raw:
+        raw["events"] = [LedgerEvent(**event) for event in raw["events"]]
+    if "jobs" in raw:
+        raw["jobs"] = [Job(**job) for job in raw["jobs"]]
+    return GameState(**raw)
+
+
+def load_game(path: Path) -> tuple[GameState, SaveStamp]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
-        _verify(type(document["version"]) is int and document["version"] == VERSION,
-                f"Unsupported save version. Expected {VERSION}.")
+        version = document["version"]
+        _verify(type(version) is int and version in SUPPORTED_VERSIONS,
+                f"Unsupported save version {version}. Expected 1 or {VERSION}.")
         raw = document["state"]
-        raw["character"] = Character(**raw["character"])
-        raw["ships"] = {
-            ship_id: Ship(**{**ship, "health": Integrity(**ship["health"])})
-            for ship_id, ship in raw["ships"].items()
-        }
-        raw["markets"] = {system: Market(**market) for system, market in raw["markets"].items()}
-        if raw["encounter"] is not None:
-            raw["encounter"] = Encounter(**{**raw["encounter"],
-                                           "health": Integrity(**raw["encounter"]["health"])})
-        state = GameState(**raw)
+        if version == 1:
+            # Version 1 has no ledger, jobs, or wall clock. Do not invent any of them.
+            raw.pop("events", None)
+            raw.pop("jobs", None)
+            raw.pop("next_event", None)
+            stamp = SaveStamp(None, None)
+        else:
+            _verify("events" in raw and "jobs" in raw and "next_event" in raw,
+                    "Version 2 save is missing ledger or manufacturing fields.")
+            rate = document["rate"]
+            _verify(type(rate) in (int, float) and isfinite(rate) and 1 <= float(rate) <= 60,
+                    "Invalid saved rate.")
+            stamp = SaveStamp(parse_utc(document["saved_at"]), float(rate))
+        state = _assemble_state(raw)
         _check_pilot(state.character)
         _check_world(state)
-        return state
+        return state, stamp
     except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError,
             RecursionError, GameError) as error:
         raise GameError(f"Could not load {path}: {error}") from error

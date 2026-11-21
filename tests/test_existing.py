@@ -2,6 +2,7 @@
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from farline.game import Game
@@ -9,9 +10,20 @@ from farline.market import GameError
 from farline.models import GameState
 from farline.persistence import load_game, save_game
 
+SAVED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
 
 def fresh(seed: int = 7) -> Game:
     return Game(GameState.fresh("Rook Vale", seed=seed))
+
+
+def persist(path: Path, state: GameState) -> None:
+    save_game(path, state, rate=6, saved_at=SAVED_AT)
+
+
+def restore(path: Path) -> GameState:
+    state, _stamp = load_game(path)
+    return state
 
 
 class FreshGameTests(unittest.TestCase):
@@ -39,6 +51,9 @@ class FreshGameTests(unittest.TestCase):
         self.assertEqual(state.draws, 0)
         self.assertEqual(state.seed, 7)
         self.assertEqual(state.next_ship, 3)
+        self.assertEqual(state.events, [])
+        self.assertEqual(state.jobs, [])
+        self.assertEqual(state.next_event, 1)
         self.assertEqual(state.ships["s1"].system, "hinge")
         self.assertEqual(Game(state).system, "hinge")
 
@@ -180,8 +195,8 @@ class CombatRngTests(unittest.TestCase):
         paused.combat("fire")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "fight.json"
-            save_game(path, paused.state)
-            resumed = Game(load_game(path))
+            persist(path, paused.state)
+            resumed = Game(restore(path))
         resumed.combat("brace")
         encounter = resumed.state.encounter
         health = resumed.ship.health
@@ -217,8 +232,8 @@ class SaveRoundTripTests(unittest.TestCase):
         game.combat("fire")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "career.json"
-            save_game(path, game.state)
-            restored = load_game(path)
+            persist(path, game.state)
+            restored = restore(path)
         self.assertEqual(restored.character, game.state.character)
         self.assertEqual(restored.ships, game.state.ships)
         self.assertEqual(restored.hangars, game.state.hangars)
@@ -232,6 +247,9 @@ class SaveRoundTripTests(unittest.TestCase):
         self.assertEqual(restored.docked, game.state.docked)
         self.assertEqual(restored.encounter, game.state.encounter)
         self.assertEqual(restored.next_ship, game.state.next_ship)
+        self.assertEqual(restored.events, game.state.events)
+        self.assertEqual(restored.jobs, game.state.jobs)
+        self.assertEqual(restored.next_event, game.state.next_event)
 
 
 if __name__ == "__main__":

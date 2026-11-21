@@ -1,9 +1,11 @@
 """Game rules. The terminal and save-file I/O sit outside this module."""
 
 from hashlib import sha256
-from math import ceil
+from math import ceil, isfinite
 
 from .catalog import HULLS, ITEMS, LANES, MODULES, SKILLS, SYSTEMS, Module
+from .events import record_event
+from .industry import RECIPES, Job, resolve_jobs
 from .market import MAX_ORDER, GameError, credits
 from .models import Character, Encounter, GameState, Integrity, Ship, stow, volume
 
@@ -68,6 +70,8 @@ class Game:
             raise GameError(f"Requires {SKILLS[skill].name} {LEVELS[level]}.")
 
     def advance(self, seconds: float) -> list[str]:
+        if not isfinite(seconds) or seconds < 0:
+            raise GameError("Time cannot move backward.")
         before = self.state.elapsed
         self.state.elapsed += seconds
         training = self.pilot.train(seconds)
@@ -83,8 +87,37 @@ class Game:
             self.ship.restore(self.pilot)
         elif self.state.encounter is None:
             self._recharge(seconds * 0.55)
-        return [f"Training complete · {SKILLS[skill].name} {LEVELS[level]}"
-                for skill, level in training]
+
+        deposits, completions = resolve_jobs(self.state.jobs, seconds)
+        for deposit in deposits:
+            stow(self.state.hangars[deposit.station], deposit.item, deposit.quantity)
+        pending = []
+        for skill, level, offset in training:
+            summary = f"Training complete · {SKILLS[skill].name} {LEVELS[level]}"
+            pending.append((min(before + offset, self.state.elapsed), "skill_complete", summary, {
+                "skill": skill, "level": level,
+            }))
+        for completion in completions:
+            summary = (f"Manufacturing complete · {RECIPES[completion.recipe].name} "
+                       f"× {completion.ordered} at {SYSTEMS[completion.station].station}")
+            pending.append((min(before + completion.time_offset, self.state.elapsed),
+                            "manufacture_complete", summary, {
+                "recipe": completion.recipe,
+                "quantity": completion.ordered,
+                "station": completion.station,
+                "output": completion.output,
+                "output_quantity": completion.output_quantity,
+            }))
+        pending.sort(key=lambda item: (item[0], item[1]))
+        for when, kind, summary, data in pending:
+            self.record(kind, summary, data, when)
+        return [summary for _when, _kind, summary, _data in pending]
+
+    def record(self, kind: str, summary: str, data: dict, when: float | None = None) -> None:
+        self.state.next_event = record_event(
+            self.state.events, self.state.next_event, time=self.state.elapsed if when is None else when,
+            kind=kind, summary=summary, data=data,
+        )
 
     def _recharge(self, amount: float) -> None:
         self.ship.capacitor = min(self.ship.stats(self.pilot).capacitor,
@@ -261,6 +294,36 @@ class Game:
         del self.state.ships[ship_id]
         return (f"Sold {ship_id} · {ship.design.name} for {credits(quote.net)}. "
                 "Its fittings and cargo were moved to the local hangar.")
+
+    def start_job(self, recipe_id: str, quantity: int) -> str:
+        self._require_docked()
+        _count(quantity)
+        recipe = RECIPES.get(recipe_id)
+        if recipe is None:
+            raise GameError(f"Unknown recipe {recipe_id!r}. Use industry to list recipes.")
+        shortages = []
+        for item, each in recipe.inputs:
+            need = each * quantity
+            have = self.hangar.get(item, 0)
+            if have < need:
+                shortages.append(f"{need} × {ITEMS[item].name} (have {have})")
+        if shortages:
+            raise GameError("Manufacturing needs " + ", ".join(shortages) + " in the local hangar.")
+        consumed = []
+        for item, each in recipe.inputs:
+            need = each * quantity
+            stow(self.hangar, item, -need)
+            consumed.append({"item": item, "quantity": need})
+        self.state.jobs.append(Job(recipe.id, quantity, quantity, self.system))
+        summary = (f"Manufacturing started · {recipe.name} × {quantity} "
+                   f"at {SYSTEMS[self.system].station}")
+        self.record("manufacture_start", summary, {
+            "recipe": recipe.id,
+            "quantity": quantity,
+            "station": self.system,
+            "inputs": consumed,
+        })
+        return summary + ". Inputs reserved from the local hangar."
 
     def mine(self, ore: str | None, cycles: int) -> list[str]:
         self._require_space()
