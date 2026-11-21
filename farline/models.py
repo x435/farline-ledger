@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from secrets import randbits
 
 from .catalog import HULLS, ITEMS, MODULES, SKILLS, SYSTEMS, SLOTS, Hull
+from .events import LedgerEvent
+from .industry import Job
 from .market import GameError, Market
 
 MAX_LEVEL = 5
@@ -61,8 +63,9 @@ class Character:
             plan.append((skill, levels[skill], duration, elapsed))
         return plan
 
-    def train(self, seconds: float) -> list[tuple[str, int]]:
+    def train(self, seconds: float) -> list[tuple[str, int, float]]:
         completed = []
+        consumed = 0.0
         while self.queue and seconds > 0:
             skill = self.queue[0]
             target = self.level(skill) + 1
@@ -74,10 +77,11 @@ class Character:
                 self.points[skill] = min(required, progress + seconds * rate)
                 break
             seconds -= duration
+            consumed += duration
             self.levels[skill] = target
             self.points.pop(skill, None)
             self.queue.pop(0)
-            completed.append((skill, target))
+            completed.append((skill, target, consumed))
         return completed
 
 
@@ -193,6 +197,9 @@ class GameState:
     elapsed: float = 0.0
     draws: int = 0
     encounter: Encounter | None = None
+    events: list[LedgerEvent] = field(default_factory=list)
+    jobs: list[Job] = field(default_factory=list)
+    next_event: int = 1
 
     @classmethod
     def fresh(cls, name: str, seed: int | None = None) -> "GameState":

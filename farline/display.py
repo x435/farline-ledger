@@ -24,7 +24,11 @@ class Display:
 
     def lines(self, messages: Iterable[str]) -> None:
         for message in messages:
-            self.line(message, "green" if message.startswith("Training complete") else "")
+            notable = message.startswith((
+                "Training complete", "Manufacturing complete", "Manufacturing started",
+                "Offline catch-up", "Clock anomaly",
+            ))
+            self.line(message, "green" if notable else "")
 
     def panel(self, title: str, content: str) -> None:
         if self.console is None:
